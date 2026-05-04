@@ -1,0 +1,446 @@
+"""
+snam_bot.py
+-----------
+Monitors SNAM's public storage capacity auction portal (Jarvis) for new
+within-day (infragiornaliera) auction results, and delivers formatted
+Telegram alerts whenever fresh data is detected.
+
+Workflow
+--------
+1. Headless Chrome downloads the latest Excel report from the SNAM portal.
+2. The report is parsed to extract the most recent auction timestamp and rows.
+3. A lightweight signature is compared against the previously seen signature.
+4. If the data changed, a structured Telegram message is sent and the new
+   signature is persisted to disk.
+
+Usage
+-----
+    python snam_bot.py          # single run (designed for cron / Task Scheduler)
+
+Environment variables (via .env)
+---------------------------------
+    TELEGRAM_TOKEN    : Bot token obtained from @BotFather
+    TELEGRAM_CHAT_ID  : Target chat or channel ID
+"""
+
+import time
+import os
+import glob
+import pandas as pd
+import shutil
+import requests
+import logging
+from logging.handlers import RotatingFileHandler
+from datetime import datetime
+from dotenv import load_dotenv
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+import truststore
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. SETTINGS AND ENVIRONMENT VARIABLES
+# ─────────────────────────────────────────────────────────────────────────────
+load_dotenv()
+
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Resolved at import time so all helpers share the same base paths.
+WORK_DIR    = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR     = os.path.join(WORK_DIR, "bot_logs")
+TARGET_FILE = os.path.join(WORK_DIR, "snam_latest_data.xlsx")
+STATUS_FILE = os.path.join(WORK_DIR, "snam_last_sig.txt")
+
+# Source URL: within-day auctions for the 2025/2026 thermal year.
+PORTAL_URL = (
+    "https://jarvis.snam.it/public-data"
+    "?pubblicazione=Capacit%C3%A0%20di%20Stoccaggio%20-%20Esiti%20Aste%20Short%20Term"
+    "&periodo=2025%2F2026"
+    "&lang=it"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. SSL / TLS — SYSTEM CERTIFICATE STORE
+# ─────────────────────────────────────────────────────────────────────────────
+# Inject the OS trust store into Python's ssl module so that all outbound
+# HTTPS requests (requests, urllib3, etc.) validate against system-managed
+# CA certificates instead of the bundled certifi bundle.
+truststore.inject_into_ssl()
+
+
+def create_secure_session() -> requests.Session:
+    """Return a requests.Session with a sensible default timeout."""
+    session = requests.Session()
+    session.timeout = 30
+    return session
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("SnamBot")
+logger.setLevel(logging.INFO)
+
+# Guard against duplicate handlers when the module is reloaded in interactive
+# environments (e.g., Jupyter, watchdog-based reloaders).
+if not logger.handlers:
+    _file_handler = RotatingFileHandler(
+        os.path.join(LOG_DIR, "snam_bot.log"),
+        maxBytes=5 * 1024 * 1024,   # 5 MB per file
+        backupCount=3,
+        encoding="utf-8",
+    )
+    _file_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+    )
+
+    _console_handler = logging.StreamHandler()
+    _console_handler.setFormatter(
+        logging.Formatter("%(asctime)s - %(message)s")
+    )
+
+    logger.addHandler(_file_handler)
+    logger.addHandler(_console_handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. HELPER FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def clean_old_files() -> None:
+    """
+    Remove stale Excel files from the working directory.
+
+    The current TARGET_FILE is preserved so that an interrupted previous run
+    does not leave an orphan that would be mistaken for a fresh download.
+    """
+    for path in glob.glob(os.path.join(WORK_DIR, "*.xlsx")):
+        if os.path.basename(path) == os.path.basename(TARGET_FILE):
+            continue
+        try:
+            os.remove(path)
+            logger.info(f"🗑️  Removed stale file: {os.path.basename(path)}")
+        except OSError as exc:
+            logger.warning(f"Could not remove file {path}: {exc}")
+
+
+def send_telegram(message: str) -> None:
+    """
+    Send a Markdown-formatted message to the configured Telegram chat.
+
+    SSL verification is enforced via the system trust store injected at
+    module load time (truststore). Never uses verify=False.
+    """
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("⚠️  TELEGRAM_TOKEN or TELEGRAM_CHAT_ID missing in .env")
+        return
+
+    session = create_secure_session()
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id":    TELEGRAM_CHAT_ID,
+            "text":       message,
+            "parse_mode": "Markdown",
+        }
+        response = session.post(url, json=payload, timeout=15)
+
+        if response.status_code != 200:
+            logger.error(f"❌ Telegram API error {response.status_code}: {response.text}")
+        else:
+            logger.info("✅ Telegram message delivered.")
+
+    except requests.exceptions.SSLError as exc:
+        logger.error(f"❌ SSL verification failed: {exc}")
+        logger.error("   Check that your system CA store is up-to-date.")
+    except requests.exceptions.ConnectionError as exc:
+        logger.error(f"❌ Network connection error: {exc}")
+    except Exception as exc:
+        logger.error(f"❌ Unexpected error sending Telegram message: {exc}")
+    finally:
+        session.close()
+
+
+def verify_ssl_certificates() -> None:
+    """
+    Smoke-test HTTPS connectivity at startup using the system trust store.
+
+    A failed test is logged as a warning but does not abort execution, because
+    the target SNAM portal may still be reachable even if google.com is not.
+    """
+    logger.info("🔒 SSL mode: Truststore (system certificate store)")
+    session = create_secure_session()
+    try:
+        resp = session.get("https://www.google.com", timeout=10)
+        if resp.status_code == 200:
+            logger.info("✅ SSL connectivity test passed.")
+    except Exception as exc:
+        logger.warning(f"⚠️  SSL connectivity test failed: {exc}")
+    finally:
+        session.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. CORE BOT LOGIC
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_chrome_driver() -> webdriver.Chrome:
+    """Configure and return a headless Chrome WebDriver instance."""
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless=new")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--log-level=3")   # suppress Chrome's own console noise
+
+    # Direct Chrome downloads to the working directory without prompting.
+    options.add_experimental_option("prefs", {
+        "download.default_directory":  WORK_DIR,
+        "download.prompt_for_download": False,
+        "safebrowsing.enabled":         True,
+    })
+
+    return webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=options,
+    )
+
+
+def _click_download_button(driver: webdriver.Chrome) -> bool:
+    """
+    Trigger the Excel download for the within-day (INFRAGIORNALIERA) report.
+
+    The SNAM portal renders custom web components with shadow DOMs; the button
+    lives inside a <ds-button> shadow root, so it cannot be targeted with a
+    standard CSS selector from outside. JavaScript is used to pierce the shadow
+    boundary and click the underlying <button> element.
+
+    Returns True if the click was dispatched, False if the element was not found.
+    """
+    js_cmd = """
+        const rows = document.querySelectorAll('.jrvs-descriptive-file-upload-status');
+        for (const row of rows) {
+            if (row.innerText.toUpperCase().includes('INFRAGIORNALIERA')) {
+                const btn = row.querySelector('ds-button[button-icon="icon-download-animated"]');
+                if (btn) {
+                    const inner = btn.shadowRoot && btn.shadowRoot.querySelector('button');
+                    (inner || btn).click();
+                    return true;
+                }
+            }
+        }
+        return false;
+    """
+    return driver.execute_script(js_cmd)
+
+
+def _wait_for_download(timeout: int = 30) -> bool:
+    """
+    Poll the working directory until a completed Excel download is detected.
+
+    Chrome writes partial downloads with a .crdownload suffix; only files
+    without that suffix and not matching TARGET_FILE are treated as complete.
+
+    Returns True if a file was found and moved to TARGET_FILE within the
+    timeout window, False otherwise.
+    """
+    for _ in range(timeout):
+        candidates = [
+            f for f in glob.glob(os.path.join(WORK_DIR, "*.xlsx"))
+            if "snam_latest_data" not in f and not f.endswith(".crdownload")
+        ]
+        if candidates:
+            latest = max(candidates, key=os.path.getctime)
+            shutil.move(latest, TARGET_FILE)
+            logger.info("📥 Download complete — file ready for processing.")
+            return True
+        time.sleep(1)
+
+    logger.error("⏱️  Download timed out — file did not appear within the expected window.")
+    return False
+
+
+def _parse_excel_and_notify() -> None:
+    """
+    Parse the downloaded Excel report and send a Telegram alert if data changed.
+
+    The report has a variable number of header rows; the function locates the
+    true header by scanning for the sentinel text "ANNO TERMICO". Rows are then
+    grouped by their combined date+time stamp, and only the latest group is
+    compared against the persisted signature.
+
+    Signature format (written to STATUS_FILE):
+        <latest_timestamp>_<row_count>_<total_offered_kwh>_<total_requested_kwh>
+
+    This ensures that both the timestamp and the aggregate quantities must
+    change before an alert is emitted, guarding against spurious retriggers
+    caused by minor restatements of older rows.
+    """
+    try:
+        df = pd.read_excel(TARGET_FILE, header=None, engine="openpyxl")
+
+        # ── Locate the header row ────────────────────────────────────────────
+        header_idx = next(
+            (i for i, row in df.head(15).iterrows()
+             if "ANNO TERMICO" in " ".join(str(v) for v in row.values).upper()),
+            -1,
+        )
+        if header_idx == -1:
+            logger.error("❌ Could not locate header row (expected 'ANNO TERMICO').")
+            return
+
+        df.columns = df.iloc[header_idx].astype(str).str.strip()
+        df = df.iloc[header_idx + 1:].copy()
+
+        # ── Parse timestamps ─────────────────────────────────────────────────
+        # The auction date is stored in "VALIDITA CONFERIMENTO" (DD/MM/YYYY).
+        # The hour slot is embedded in the "PRODOTTO" field as "(HH:MM)".
+        df["Date"] = pd.to_datetime(
+            df["VALIDITA CONFERIMENTO"], dayfirst=True, errors="coerce"
+        )
+        df["Time"] = (
+            df["PRODOTTO"].astype(str).str.extract(r"\((\d{1,2}:\d{2})\)")[0]
+            .fillna("00:00")
+        )
+        df["FullDate"] = df["Date"] + pd.to_timedelta(df["Time"] + ":00")
+
+        if df["FullDate"].isnull().all():
+            logger.error("❌ Could not parse any timestamps — check the date column format.")
+            return
+
+        # ── Identify the most recent auction slot ────────────────────────────
+        latest_ts   = df["FullDate"].max()
+        latest_rows = df[df["FullDate"] == latest_ts]
+
+        # ── Build and compare signatures ─────────────────────────────────────
+        offered    = latest_rows["QTA OFFERTA (KWH)"].sum()
+        requested  = latest_rows["QTA RICHIESTA (KWH)"].sum()
+        current_sig = f"{latest_ts}_{len(latest_rows)}_{int(offered)}_{int(requested)}"
+
+        last_sig = ""
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, "r", encoding="utf-8") as fh:
+                last_sig = fh.read().strip()
+
+        if current_sig == last_sig:
+            logger.info("ℹ️  Data unchanged — no notification sent.")
+            return
+
+        # ── New data detected: build and send the Telegram message ───────────
+        logger.info("🆕 New data detected — composing Telegram message.")
+
+        msg  = "📊 *SNAM AUCTION RESULTS*\n"
+        msg += f"🕐 {latest_ts.strftime('%d/%m/%Y %H:%M')}\n\n"
+
+        for _, row in latest_rows.iterrows():
+            product_upper   = str(row["PRODOTTO"]).upper()
+            capacity_upper  = str(row.get("TIPO CAPACITA", "")).upper()
+            service_upper   = str(row.get("PRESTAZIONE", "")).upper()
+
+            # Product type: within-day vs. day-ahead
+            p_type = "WITHINDAY" if "INFRAGIORNALIERA" in product_upper else "DAYAHEAD"
+
+            # Capacity type: firm (continuous) vs. interruptible
+            cap_type = "FIRM" if "CONTINUA" in capacity_upper else "INT"
+
+            # Direction
+            if "INIEZIONE" in service_upper:
+                action = "INJECTION"
+            elif "EROGAZIONE" in service_upper:
+                action = "WITHDRAWAL"
+            else:
+                action = "OTHER"
+
+            # Format large integers with dot thousands separator (Italian convention)
+            def fmt_kwh(val) -> str:
+                return f"{int(val):,}".replace(",", ".")
+
+            avail_str     = fmt_kwh(row.get("QTA OFFERTA (KWH)",   0))
+            requested_str = fmt_kwh(row.get("QTA RICHIESTA (KWH)", 0))
+            marketed_str  = fmt_kwh(row.get("QTA CONFERITA (KWH)", 0))
+
+            try:
+                price_str = f"{float(row.get('PREZZO (€cent/kWh)', 0)):.4f}"
+            except (TypeError, ValueError):
+                price_str = str(row.get("PREZZO (€cent/kWh)", "N/A"))
+
+            msg += f"--- {action} / {p_type} ---\n"
+            msg += f"Type:      {cap_type}\n"
+            msg += f"Price:     *{price_str}* €cent/kWh\n"
+            msg += f"Offer:     *{avail_str}* kWh/d\n"
+            msg += f"Request:   *{requested_str}* kWh/d\n"
+            msg += f"Allocated: *{marketed_str}* kWh/d\n\n"
+
+        send_telegram(msg)
+
+        # Persist the new signature only after a successful dispatch attempt.
+        with open(STATUS_FILE, "w", encoding="utf-8") as fh:
+            fh.write(current_sig)
+
+    except Exception as exc:
+        import traceback
+        logger.error(f"❌ Error during Excel parsing or notification: {exc}")
+        logger.error(traceback.format_exc())
+
+
+def run_bot_logic() -> None:
+    """
+    Orchestrate a single bot run:
+
+    1. Clean up any leftover Excel files from previous runs.
+    2. Open the SNAM portal in a headless browser and trigger the download.
+    3. Wait for the file to land and rename it to TARGET_FILE.
+    4. Parse the file, compare with the last known signature, and notify.
+    """
+    logger.info("🚀 Starting SNAM bot run...")
+
+    clean_old_files()
+
+    driver = None
+    try:
+        driver = _build_chrome_driver()
+        logger.info(f"🌐 Loading portal: {PORTAL_URL}")
+        driver.get(PORTAL_URL)
+        # Allow dynamic content (JavaScript, lazy-loaded components) to render.
+        time.sleep(8)
+
+        if not _click_download_button(driver):
+            logger.error("❌ Download button not found — page structure may have changed.")
+            return
+
+        logger.info("⏳ Waiting for download to complete...")
+        if not _wait_for_download():
+            return
+
+    except Exception as exc:
+        logger.error(f"❌ Browser error: {exc}")
+        return
+    finally:
+        if driver:
+            driver.quit()
+
+    if os.path.exists(TARGET_FILE):
+        _parse_excel_and_notify()
+    else:
+        logger.error("❌ TARGET_FILE not found after download step.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print("  SNAM AUCTION BOT")
+    print("=" * 60)
+
+    verify_ssl_certificates()
+
+    try:
+        run_bot_logic()
+        logger.info("✅ Run completed successfully.")
+    except Exception as exc:
+        logger.error(f"❌ Critical unhandled error: {exc}")
