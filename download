@@ -1,0 +1,31 @@
+# ── Secrets ───────────────────────────────────────────────────────────────────
+.env
+
+# ── Bot runtime files ─────────────────────────────────────────────────────────
+snam_latest_data.xlsx
+snam_last_sig.txt
+bot_logs/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+
+# ── OS / editor artifacts ─────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
