@@ -113,13 +113,13 @@ python snam_bot.py
 
 The bot is designed for **single-run execution** (no internal loop). Schedule it externally to match the portal's update cadence.
 
-**Linux / macOS — cron** (every 10 minutes):
+**Linux / macOS — cron** repeat every 60 minutesin 42.minute of each hour (xx:42)
 ```cron
 */10 * * * * /usr/bin/python3 /path/to/snam_bot.py >> /path/to/bot_logs/cron.log 2>&1
 ```
 
 **Windows — Task Scheduler:**
-- Trigger: repeat every 10 minutes
+- Trigger: repeat every 60 minutesin 42.minute of each hour (xx:42)
 - Action: `python C:\path\to\snam_bot.py`
 
 ---
